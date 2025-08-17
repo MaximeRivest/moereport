@@ -1,0 +1,83 @@
+
+```{python}
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from collections import defaultdict
+```
+
+```{python}
+# Model setup (use FP8 for VRAM efficiency; ~30GB footprint)
+model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507"  # Or original: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    device_map="auto",  # Multi-GPU
+    torch_dtype=torch.float8_e4m3fn if "FP8" in model_name else torch.bfloat16,  # FP8 or bfloat16
+    output_router_logits=True  # Enable tracking
+)
+```
+
+
+```{python}
+
+```
+num_experts = 128  # From model docs
+top_k = 8  # Activated per token
+
+def generate_and_track(prompts, max_new_tokens=50):
+    expert_counts = defaultdict(lambda: defaultdict(int))  # layer -> expert -> count
+    total_selections = defaultdict(int)  # layer -> total top-k selections
+
+    for prompt in prompts:
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        generated_ids = inputs.input_ids
+        past_key_values = None
+
+        for _ in range(max_new_tokens):
+            outputs = model(
+                input_ids=generated_ids[:, -1:],  # Process one token
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_router_logits=True
+            )
+            router_logits = outputs.router_logits  # List of tensors/None per layer
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(0)
+            generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+            past_key_values = outputs.past_key_values
+
+            # Process logits for new token (filter None)
+            for layer_idx, logits in enumerate(router_logits):
+                if logits is None:
+                    continue  # Skip MLP-only layers
+                probs = torch.softmax(logits, dim=-1)  # (1, 1, num_experts)
+                top_experts = torch.topk(probs[0, 0], top_k).indices.tolist()  # Top-8 experts
+                for exp in top_experts:
+                    expert_counts[layer_idx][exp] += 1
+                total_selections[layer_idx] += top_k
+
+    return expert_counts, total_selections
+
+def generate_report(expert_counts, total_selections):
+    print("Expert Usage Report (Aggregated over all generations):")
+    for layer_idx in sorted(expert_counts.keys()):
+        counts = expert_counts[layer_idx]
+        total = total_selections[layer_idx]
+        used_experts = len(counts)
+        usage_ratios = {exp: count / total for exp, count in sorted(counts.items())}
+        unused = set(range(num_experts)) - set(counts.keys())
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  - Unique experts used: {used_experts} / {num_experts} ({used_experts / num_experts:.2%})")
+        print(f"  - Unused experts: {sorted(unused)} (count: {len(unused)})")
+        print(f"  - Usage ratios (top 5 shown):")
+        for exp, ratio in sorted(usage_ratios.items(), key=lambda x: x[1], reverse=True)[:5]:
+            print(f"    Expert {exp}: {ratio:.2%}")
+
+# Example usage: Replace with your domain-specific prompts
+domain_prompts = [
+    "Solve this math problem: Integrate x^2 from 0 to 1.",  # Domain: Math
+    "Write code to sort a list in Python.",  # Domain: Coding
+    # Add more...
+]
+counts, totals = generate_and_track(domain_prompts, max_new_tokens=100)
+generate_report(counts, totals)
