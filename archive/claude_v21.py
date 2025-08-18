@@ -909,7 +909,8 @@ if __name__ == "__main__":
         "Explain quantum computing",
     ]
     logger, analyzer, pruner = example_comprehensive_analysis(
-        model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        model_name="openai/gpt-oss-120b",
+        # model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
         prompts=custom_prompts,
         task_name="mixed_tasks",
         max_new_tokens=50

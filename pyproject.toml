@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "accelerate>=1.10.0",
+    "compressed-tensors>=0.10.2",
     "ipykernel>=6.30.1",
     "ipywidgets>=8.1.7",
     "matplotlib>=3.10.5",
