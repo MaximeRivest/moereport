@@ -13,71 +13,297 @@ model = AutoModelForCausalLM.from_pretrained(
     model_name,
     device_map="auto",  # Multi-GPU
     torch_dtype=torch.float8_e4m3fn if "FP8" in model_name else torch.bfloat16,  # FP8 or bfloat16
-    output_router_logits=True  # Enable tracking
 )
+```
+
+```{python}
+
+# Get model configuration
+num_experts = model.config.num_routed_experts if hasattr(model.config, 'num_routed_experts') else 128
+top_k = model.config.num_experts_per_tok if hasattr(model.config, 'num_experts_per_tok') else 8
+num_hidden_layers = model.config.num_hidden_layers
+
+print(f"Model Configuration:")
+print(f"  - Number of experts: {num_experts}")
+print(f"  - Experts per token: {top_k}")
+print(f"  - Hidden layers: {num_hidden_layers}")
+print()
+
+```
+
+```{python}
+
+def generate_and_track_v2(prompts, max_new_tokens=100):
+    """
+    Alternative tracking method using forward passes instead of generate.
+    This avoids the router_logits issues in generate().
+    """
+    expert_counts = defaultdict(lambda: defaultdict(int))
+    total_selections = defaultdict(int)
+    
+    for prompt in prompts:
+        # Tokenize input
+        inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
+        
+        # Generate tokens one by one to track router decisions
+        generated_ids = inputs.input_ids.clone()
+        
+        for _ in range(max_new_tokens):
+            with torch.no_grad():
+                # Forward pass with router logits
+                outputs = model(
+                    input_ids=generated_ids,
+                    output_router_logits=True,
+                    return_dict=True
+                )
+                
+                # Get next token
+                next_token_logits = outputs.logits[:, -1, :]
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                
+                # Process router logits if available
+                if hasattr(outputs, 'router_logits') and outputs.router_logits:
+                    for layer_idx, layer_logits in enumerate(outputs.router_logits):
+                        if layer_logits is None:
+                            continue
+                        
+                        # layer_logits shape: (batch_size, seq_len, num_experts)
+                        # We're interested in the last token's routing decision
+                        last_token_logits = layer_logits[:, -1, :]  # (batch_size, num_experts)
+                        
+                        # Convert to probabilities
+                        probs = torch.softmax(last_token_logits, dim=-1)
+                        
+                        # Get top-k experts
+                        k = min(top_k, probs.shape[-1])
+                        top_experts = torch.topk(probs[0], k).indices.tolist()
+                        
+                        # Track expert usage
+                        for exp in top_experts:
+                            expert_counts[layer_idx][exp] += 1
+                        total_selections[layer_idx] += k
+                
+                # Stop if we hit EOS token
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
+    
+    return expert_counts, total_selections
+
+def generate_and_track_batch(prompts, max_new_tokens=100, track_method="forward"):
+    """
+    Main tracking function with fallback methods.
+    """
+    if track_method == "forward":
+        return generate_and_track_v2(prompts, max_new_tokens)
+    else:
+        # Alternative: Use hooks to track expert routing
+        return track_with_hooks(prompts, max_new_tokens)
+
+def track_with_hooks(prompts, max_new_tokens=100):
+    """
+    Track expert usage using forward hooks on MoE layers.
+    """
+    expert_counts = defaultdict(lambda: defaultdict(int))
+    total_selections = defaultdict(int)
+    current_layer = [0]  # Use list to make it mutable in nested function
+    
+    def hook_fn(module, input, output):
+        """Hook to capture router decisions"""
+        if hasattr(output, 'router_logits') and output.router_logits is not None:
+            layer_idx = current_layer[0]
+            router_logits = output.router_logits
+            
+            if router_logits is not None:
+                # Process the router logits
+                probs = torch.softmax(router_logits, dim=-1)
+                
+                # Handle different shapes
+                if len(probs.shape) == 3:  # (batch, seq, experts)
+                    probs = probs.reshape(-1, probs.shape[-1])
+                elif len(probs.shape) == 2:  # (batch*seq, experts)
+                    pass
+                else:
+                    return
+                
+                # Get top-k for each token
+                k = min(top_k, probs.shape[-1])
+                for token_probs in probs:
+                    top_experts = torch.topk(token_probs, k).indices.tolist()
+                    for exp in top_experts:
+                        expert_counts[layer_idx][exp] += 1
+                    total_selections[layer_idx] += k
+            
+            current_layer[0] += 1
+    
+    # Register hooks on MoE layers
+    hooks = []
+    for name, module in model.named_modules():
+        if "block_sparse_moe" in name or "moe" in name.lower():
+            hooks.append(module.register_forward_hook(hook_fn))
+    
+    try:
+        for prompt in prompts:
+            current_layer[0] = 0
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            
+            with torch.no_grad():
+                # Simple generation
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                    output_router_logits=False  # Disable to avoid the error
+                )
+    finally:
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+    
+    return expert_counts, total_selections
+
+def generate_report(expert_counts, total_selections):
+    """
+    Generate a detailed report of expert usage.
+    """
+    print("\nExpert Usage Report")
+    print("=" * 70)
+    
+    if not expert_counts:
+        print("No expert routing data collected.")
+        return
+    
+    # Overall statistics
+    total_layers_with_routing = len(expert_counts)
+    total_expert_activations = sum(sum(counts.values()) for counts in expert_counts.values())
+    unique_experts_used = set()
+    for counts in expert_counts.values():
+        unique_experts_used.update(counts.keys())
+    
+    print(f"\nOverall Statistics:")
+    print(f"  - Layers with routing data: {total_layers_with_routing}")
+    print(f"  - Total expert activations: {total_expert_activations:,}")
+    print(f"  - Unique experts used globally: {len(unique_experts_used)} / {num_experts}")
+    
+    # Per-layer analysis
+    print(f"\nPer-Layer Analysis:")
+    print("-" * 70)
+    
+    for layer_idx in sorted(expert_counts.keys())[:5]:  # Show first 5 layers
+        counts = expert_counts[layer_idx]
+        total = total_selections[layer_idx]
+        
+        if total == 0:
+            continue
+        
+        used_experts = len(counts)
+        usage_ratios = {exp: count / total for exp, count in counts.items()}
+        unused = set(range(num_experts)) - set(counts.keys())
+        
+        print(f"\nLayer {layer_idx}:")
+        print(f"  • Unique experts used: {used_experts} / {num_experts} ({used_experts / num_experts:.1%})")
+        print(f"  • Total selections: {total:,}")
+        print(f"  • Unused experts: {len(unused)}")
+        
+        # Show top experts
+        print(f"  • Top 5 most used experts:")
+        for i, (exp, ratio) in enumerate(sorted(usage_ratios.items(), 
+                                                key=lambda x: x[1], 
+                                                reverse=True)[:5], 1):
+            count = counts[exp]
+            print(f"      {i}. Expert {exp:3d}: {ratio:5.1%} ({count:4d} selections)")
+    
+    if total_layers_with_routing > 5:
+        print(f"\n... and {total_layers_with_routing - 5} more layers")
+
+def analyze_expert_distribution(expert_counts):
+    """
+    Analyze the distribution of expert usage across layers.
+    """
+    print("\nExpert Distribution Analysis")
+    print("=" * 70)
+    
+    # Calculate expert usage frequency across all layers
+    global_expert_usage = defaultdict(int)
+    for layer_counts in expert_counts.values():
+        for expert, count in layer_counts.items():
+            global_expert_usage[expert] += count
+    
+    if not global_expert_usage:
+        print("No expert usage data to analyze.")
+        return
+    
+    # Sort experts by usage
+    sorted_experts = sorted(global_expert_usage.items(), key=lambda x: x[1], reverse=True)
+    
+    # Calculate statistics
+    total_usage = sum(global_expert_usage.values())
+    avg_usage = total_usage / num_experts
+    
+    print(f"\nGlobal Expert Usage Statistics:")
+    print(f"  • Total expert activations: {total_usage:,}")
+    print(f"  • Average usage per expert: {avg_usage:.1f}")
+    print(f"  • Experts with zero usage: {num_experts - len(global_expert_usage)}")
+    
+    # Show top and bottom experts
+    print(f"\n  Top 10 Most Used Experts:")
+    for i, (exp, count) in enumerate(sorted_experts[:10], 1):
+        percentage = (count / total_usage) * 100
+        print(f"    {i:2d}. Expert {exp:3d}: {count:6,} activations ({percentage:.2f}%)")
+    
+    if len(sorted_experts) > 10:
+        print(f"\n  Bottom 5 Used Experts (non-zero):")
+        for i, (exp, count) in enumerate(sorted_experts[-5:], 1):
+            percentage = (count / total_usage) * 100
+            print(f"    {i}. Expert {exp:3d}: {count:6,} activations ({percentage:.4f}%)")
+
+
 ```
 
 
 ```{python}
-
-```
-num_experts = 128  # From model docs
-top_k = 8  # Activated per token
-
-def generate_and_track(prompts, max_new_tokens=50):
-    expert_counts = defaultdict(lambda: defaultdict(int))  # layer -> expert -> count
-    total_selections = defaultdict(int)  # layer -> total top-k selections
-
-    for prompt in prompts:
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        generated_ids = inputs.input_ids
-        past_key_values = None
-
-        for _ in range(max_new_tokens):
-            outputs = model(
-                input_ids=generated_ids[:, -1:],  # Process one token
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_router_logits=True
-            )
-            router_logits = outputs.router_logits  # List of tensors/None per layer
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1).unsqueeze(0)
-            generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-            past_key_values = outputs.past_key_values
-
-            # Process logits for new token (filter None)
-            for layer_idx, logits in enumerate(router_logits):
-                if logits is None:
-                    continue  # Skip MLP-only layers
-                probs = torch.softmax(logits, dim=-1)  # (1, 1, num_experts)
-                top_experts = torch.topk(probs[0, 0], top_k).indices.tolist()  # Top-8 experts
-                for exp in top_experts:
-                    expert_counts[layer_idx][exp] += 1
-                total_selections[layer_idx] += top_k
-
-    return expert_counts, total_selections
-
-def generate_report(expert_counts, total_selections):
-    print("Expert Usage Report (Aggregated over all generations):")
-    for layer_idx in sorted(expert_counts.keys()):
-        counts = expert_counts[layer_idx]
-        total = total_selections[layer_idx]
-        used_experts = len(counts)
-        usage_ratios = {exp: count / total for exp, count in sorted(counts.items())}
-        unused = set(range(num_experts)) - set(counts.keys())
-
-        print(f"\nLayer {layer_idx}:")
-        print(f"  - Unique experts used: {used_experts} / {num_experts} ({used_experts / num_experts:.2%})")
-        print(f"  - Unused experts: {sorted(unused)} (count: {len(unused)})")
-        print(f"  - Usage ratios (top 5 shown):")
-        for exp, ratio in sorted(usage_ratios.items(), key=lambda x: x[1], reverse=True)[:5]:
-            print(f"    Expert {exp}: {ratio:.2%}")
-
-# Example usage: Replace with your domain-specific prompts
-domain_prompts = [
-    "Solve this math problem: Integrate x^2 from 0 to 1.",  # Domain: Math
-    "Write code to sort a list in Python.",  # Domain: Coding
-    # Add more...
+# Test prompts
+test_prompts = [
+    "What is 2 + 2?",
+    "Write a Python hello world program.",
+    "Explain photosynthesis briefly.",
 ]
-counts, totals = generate_and_track(domain_prompts, max_new_tokens=100)
-generate_report(counts, totals)
+
+print("Starting Expert Tracking Analysis")
+print("=" * 70)
+
+try:
+    # Method 1: Try with forward pass tracking
+    print("\nUsing forward pass tracking method...")
+    counts, totals = generate_and_track_v2(test_prompts, max_new_tokens=30)
+    
+    if not counts:
+        # Method 2: Fallback to hook-based tracking
+        print("Forward pass method failed, trying hook-based tracking...")
+        counts, totals = track_with_hooks(test_prompts, max_new_tokens=30)
+    
+    # Generate reports
+    generate_report(counts, totals)
+    analyze_expert_distribution(counts)
+    
+except Exception as e:
+    print(f"\nError during tracking: {e}")
+    print("\nTrying simplified analysis...")
+    
+    # Simplified analysis - just check model structure
+    print("\nModel Structure Analysis:")
+    moe_layers = []
+    for name, module in model.named_modules():
+        if "block_sparse_moe" in name or "moe" in name.lower():
+            moe_layers.append(name)
+    
+    print(f"Found {len(moe_layers)} MoE layers")
+    if moe_layers[:5]:
+        print("First 5 MoE layer names:")
+        for layer in moe_layers[:5]:
+            print(f"  - {layer}")
+
+print("\n" + "=" * 70)
+print("Analysis Complete!")
+```
