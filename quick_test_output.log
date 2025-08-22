@@ -1,0 +1,133 @@
+============================================================
+QUICK EXPERT ACTIVATION TEST
+============================================================
+
+[Loading] Model...
+Fetching 164 files:   0%|          | 0/164 [00:00<?, ?it/s]Fetching 164 files: 100%|██████████| 164/164 [00:00<00:00, 423041.73it/s]
+The following generation flags are not valid and may be ignored: ['temperature']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+`cache.key_cache[idx]` is deprecated and will be removed in v4.56.0. Use `cache.layers[idx].keys` instead.
+
+[OnDemandMoE] Patch report:
+{
+  "moe_layers": 58,
+  "experts_wrapped": 14848,
+  "gate_to_cuda": 0,
+  "shared_to_cuda": 0,
+  "per_expert_bytes_bf16_est": "84.0 MB",
+  "gpu_expert_budget": "30.0 GB"
+}
+
+[Model Stats]
+  Total experts: 14848
+  MoE layers: 58
+
+[Testing] 3 prompts...
+Traceback (most recent call last):
+  File "/home/ubuntu/moereport/quick_expert_test.py", line 38, in <module>
+    report = runtime.generate(test_prompts)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 811, in generate
+    out_ids = self.model.generate(
+        **inputs,
+    ...<5 lines>...
+        pad_token_id=self.tokenizer.eos_token_id or self.tokenizer.pad_token_id,
+    )
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/transformers/generation/utils.py", line 2629, in generate
+    result = self._sample(
+        input_ids,
+    ...<5 lines>...
+        **model_kwargs,
+    )
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/transformers/generation/utils.py", line 3610, in _sample
+    outputs = self(**model_inputs, return_dict=True)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/ubuntu/.cache/huggingface/modules/transformers_modules/deepseek-ai/DeepSeek-V3.1/3fd2c2ee85a62273a668725b3eb1a7771a26978c/modeling_deepseek.py", line 1601, in forward
+    outputs = self.model(
+        input_ids=input_ids,
+    ...<7 lines>...
+        return_dict=return_dict,
+    )
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/ubuntu/.cache/huggingface/modules/transformers_modules/deepseek-ai/DeepSeek-V3.1/3fd2c2ee85a62273a668725b3eb1a7771a26978c/modeling_deepseek.py", line 1470, in forward
+    layer_outputs = decoder_layer(
+        hidden_states,
+    ...<4 lines>...
+        use_cache=use_cache,
+    )
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/ubuntu/.cache/huggingface/modules/transformers_modules/deepseek-ai/DeepSeek-V3.1/3fd2c2ee85a62273a668725b3eb1a7771a26978c/modeling_deepseek.py", line 1216, in forward
+    hidden_states = self.mlp(hidden_states)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/ubuntu/.cache/huggingface/modules/transformers_modules/deepseek-ai/DeepSeek-V3.1/3fd2c2ee85a62273a668725b3eb1a7771a26978c/modeling_deepseek.py", line 529, in forward
+    y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
+        ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/ubuntu/.cache/huggingface/modules/transformers_modules/deepseek-ai/DeepSeek-V3.1/3fd2c2ee85a62273a668725b3eb1a7771a26978c/modeling_deepseek.py", line 584, in moe_infer
+    expert_out = expert(tokens_for_this_expert)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 461, in forward
+    if self._lru.ensure_on_gpu(key, self) and self._gpu_expert is not None and x.is_cuda:
+       ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 304, in ensure_on_gpu
+    wrapper._load_gpu()
+    ~~~~~~~~~~~~~~~~~^^
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 445, in _load_gpu
+    self._gpu_expert = self._materialize_and_load("cuda")
+                       ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 422, in _materialize_and_load
+    mod = mod.to_empty(device=device).to(dtype=self._dtype)
+          ~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1224, in to_empty
+    return self._apply(
+           ~~~~~~~~~~~^
+        lambda t: torch.empty_like(t, device=device), recurse=recurse
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 928, in _apply
+    module._apply(fn)
+    ~~~~~~~~~~~~~^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 955, in _apply
+    param_applied = fn(param)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1225, in <lambda>
+    lambda t: torch.empty_like(t, device=device), recurse=recurse
+              ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/_refs/__init__.py", line 5055, in empty_like
+    return torch.empty_permuted(
+           ~~~~~~~~~~~~~~~~~~~~^
+        a.shape,
+        ^^^^^^^^
+    ...<5 lines>...
+        requires_grad=requires_grad,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 28.00 MiB. GPU 0 has a total capacity of 139.72 GiB of which 27.12 MiB is free. Process 24676 has 83.08 GiB memory in use. Including non-PyTorch memory, this process has 56.59 GiB memory in use. Of the allocated memory 55.92 GiB is allocated by PyTorch, and 10.38 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

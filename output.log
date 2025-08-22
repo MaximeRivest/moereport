@@ -1,0 +1,26 @@
+Fetching 164 files:   0%|          | 0/164 [00:00<?, ?it/s]Fetching 164 files: 100%|██████████| 164/164 [00:00<00:00, 301695.55it/s]
+Traceback (most recent call last):
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 629, in selective_load_non_expert_weights
+    t = t.to(device)
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/cuda/__init__.py", line 412, in _lazy_init
+    torch._C._cuda_init()
+    ~~~~~~~~~~~~~~~~~~~^^
+RuntimeError: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 2: out of memory
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 984, in <module>
+    runtime = OnDemandMoERuntime(cfg)
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 708, in __init__
+    loaded = selective_load_non_expert_weights(self.model, safetensor_idx, device="cuda", dtype=self._dtype)
+  File "/home/ubuntu/moereport/moe_on_demand_runtime.py", line 633, in selective_load_non_expert_weights
+    torch.cuda.init()
+    ~~~~~~~~~~~~~~~^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/cuda/__init__.py", line 379, in init
+    _lazy_init()
+    ~~~~~~~~~~^^
+  File "/home/ubuntu/moereport/.venv/lib/python3.13/site-packages/torch/cuda/__init__.py", line 412, in _lazy_init
+    torch._C._cuda_init()
+    ~~~~~~~~~~~~~~~~~~~^^
+RuntimeError: Unexpected error from cudaGetDeviceCount(). Did you run some cuda functions before calling NumCudaDevices() that might have already set an error? Error 2: out of memory

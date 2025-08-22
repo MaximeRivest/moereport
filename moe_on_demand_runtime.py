@@ -28,6 +28,7 @@ from transformers import (
     AutoModelForCausalLM,
 )
 from transformers.utils import is_flash_attn_2_available
+from transformers.cache_utils import DynamicCache
 
 # Accelerate is used to init empty weights for huge models like DeepSeek
 try:
@@ -38,6 +39,66 @@ except Exception:
 
 # Safetensors for on-demand tensor loading
 from safetensors import safe_open
+
+# =========================
+# Cache patch for DeepSeek-V3.1
+# =========================
+
+class DeepSeekCompatibleCache(DynamicCache):
+    """
+    A patched DynamicCache that adds the seen_tokens attribute
+    required by DeepSeek-V3.1's prepare_inputs_for_generation method.
+    """
+    def __init__(self):
+        super().__init__()
+        self._seen_tokens = 0
+        self._max_cache_len = None  # No max length by default
+    
+    @property
+    def seen_tokens(self):
+        return self._seen_tokens
+    
+    def get_max_length(self):
+        """Return the maximum cache length (None means no limit)."""
+        return self._max_cache_len
+    
+    def get_usable_length(self, seq_length=None, layer_idx=None):
+        """Return the length of the cache that can be used."""
+        # For DeepSeek-V3.1, this returns how much of the cache can be reused
+        # This should return 0 on first generation (no cache yet) and the cached length on subsequent generations
+        
+        # During first forward pass, cache might not exist yet for this layer
+        if layer_idx is None:
+            # Use the general sequence length
+            return self.get_seq_length()
+            
+        # Check if we have cache for this specific layer
+        if len(self.key_cache) <= layer_idx:
+            return 0
+            
+        # If the cache exists but is None for this layer (not yet populated)
+        if self.key_cache[layer_idx] is None:
+            return 0
+            
+        # Return the cached sequence length for this layer
+        # This is the length that was cached from previous forward passes
+        return self.key_cache[layer_idx].shape[-2]
+    
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        """Update the cache and track seen tokens."""
+        # Call parent update first to ensure cache is properly initialized
+        result = super().update(key_states, value_states, layer_idx, cache_kwargs)
+        
+        # Update seen tokens tracking after cache is updated
+        if layer_idx == 0:
+            # The parent update should have populated the cache
+            # Use the actual cached tensor to calculate seen_tokens
+            if len(self.key_cache) > 0 and self.key_cache[0] is not None:
+                self._seen_tokens = self.key_cache[0].shape[-2]
+            else:
+                self._seen_tokens = key_states.shape[-2]
+        
+        return result
 
 # =========================
 # Utilities
@@ -564,7 +625,17 @@ def selective_load_non_expert_weights(model: nn.Module,
             t = f.get_tensor(k)  # CPU
             if dtype is not None and t.dtype != dtype:
                 t = t.to(dtype)
-            t = t.to(device)
+            try:
+                t = t.to(device)
+            except RuntimeError as e:
+                if "out of memory" in str(e) or "cudaGetDeviceCount" in str(e):
+                    # This error often occurs when CUDA isn't properly initialized
+                    # Try CPU fallback instead
+                    print(f"Warning: CUDA initialization error for {k}, keeping on CPU")
+                    t = t.to("cpu")
+                    device = "cpu"
+                else:
+                    raise
             set_param_by_fqn(model, k, t)
             loaded += 1
     return loaded
@@ -595,6 +666,12 @@ class RuntimeConfig:
 class OnDemandMoERuntime:
     def __init__(self, cfg: RuntimeConfig):
         self.cfg = cfg
+        
+        # Initialize CUDA early to avoid initialization errors later
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            # Don't set a specific device - let PyTorch handle device selection
+        
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
         self._dtype = torch.bfloat16 if cfg.dtype.lower() in ["bf16","bfloat16"] else torch.float16
 
@@ -651,6 +728,9 @@ class OnDemandMoERuntime:
             # Optional: FA2
             if is_flash_attn_2_available() and hasattr(self.model.config, "_attn_implementation"):
                 self.model.config._attn_implementation = self.cfg.attn_impl or "flash_attention_2"
+            
+            # Set model to eval mode
+            self.model.eval()
 
         elif strat == "standard":
             # Load full model (OK for small MoE checkpoints)
@@ -716,18 +796,36 @@ class OnDemandMoERuntime:
     def generate(self, prompts: List[str]) -> Dict[str, Any]:
         results = []
         t0 = time.time()
+        
+        # Check if this is a DeepSeek model that needs our patched cache
+        is_deepseek = "deepseek" in self.cfg.model_name.lower()
+        
         for i, p in enumerate(prompts):
             text = self._fmt_prompt(p)
             inputs = self.tokenizer(text, return_tensors="pt").to("cuda")
             torch.cuda.reset_peak_memory_stats()
-            out_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=self.cfg.max_new_tokens,
-                do_sample=(self.cfg.temperature > 0),
-                temperature=self.cfg.temperature,
-                use_cache=True,
-                pad_token_id=self.tokenizer.eos_token_id or self.tokenizer.pad_token_id,
-            )
+            
+            # Use patched cache for DeepSeek models
+            if is_deepseek:
+                past_key_values = DeepSeekCompatibleCache()
+                out_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.cfg.max_new_tokens,
+                    do_sample=(self.cfg.temperature > 0),
+                    temperature=self.cfg.temperature,
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                    pad_token_id=self.tokenizer.eos_token_id or self.tokenizer.pad_token_id,
+                )
+            else:
+                out_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.cfg.max_new_tokens,
+                    do_sample=(self.cfg.temperature > 0),
+                    temperature=self.cfg.temperature,
+                    use_cache=True,
+                    pad_token_id=self.tokenizer.eos_token_id or self.tokenizer.pad_token_id,
+                )
             out = self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
             peak = torch.cuda.max_memory_allocated()
             results.append({
