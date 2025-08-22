@@ -355,7 +355,11 @@ class DiskBackedExpert(BaseExpertWrapper):
 
     def _materialize_and_load(self, device: str) -> nn.Module:
         # Clone structure from blueprint (meta) and load tensors from shards
-        mod = copy.deepcopy(self._blueprint_meta).to(device, dtype=self._dtype)
+        # First create empty module on target device
+        mod = copy.deepcopy(self._blueprint_meta)
+        # Move to target device using to_empty for meta tensors
+        mod = mod.to_empty(device=device).to(dtype=self._dtype)
+        
         for rel in self._param_rel_names:
             key = join_module_path(self._full_prefix, rel)
             t = self._idx.get_tensor(key, device=device, dtype=self._dtype)
@@ -515,16 +519,24 @@ def set_param_by_fqn(model: nn.Module, fqn: str, tensor: torch.Tensor):
     parts = fqn.split(".")
     obj = model
     for p in parts[:-1]:
-        obj = getattr(obj, p)
+        obj = getattr(obj, p, None)
+        if obj is None:
+            return  # Skip if path doesn't exist
     last = parts[-1]
+    if not hasattr(obj, last):
+        return  # Skip if attribute doesn't exist
     cur = getattr(obj, last)
     if isinstance(cur, nn.Parameter):
-        # Ensure tensor matches the parameter's dtype and device
-        if cur.dtype != tensor.dtype:
-            tensor = tensor.to(cur.dtype)
-        if cur.device != tensor.device:
-            tensor = tensor.to(cur.device)
-        cur.data = tensor
+        # For meta tensors, we need to replace them entirely
+        if cur.is_meta:
+            setattr(obj, last, nn.Parameter(tensor, requires_grad=cur.requires_grad))
+        else:
+            # Ensure tensor matches the parameter's dtype and device
+            if cur.dtype != tensor.dtype:
+                tensor = tensor.to(cur.dtype)
+            if cur.device != tensor.device:
+                tensor = tensor.to(cur.device)
+            cur.data = tensor
     else:
         setattr(obj, last, nn.Parameter(tensor, requires_grad=False))
 
@@ -624,8 +636,18 @@ class OnDemandMoERuntime:
             )
             # Now load backbone/gate/shared to CUDA
             loaded = selective_load_non_expert_weights(self.model, safetensor_idx, device="cuda", dtype=self._dtype)
-            # Move model to CUDA after loading weights
-            self.model = self.model.to("cuda")
+            
+            # Check for any remaining meta tensors and replace them with zeros on CUDA
+            # Skip _blueprint_meta parameters as they're expected to be on meta
+            for name, module in self.model.named_modules():
+                for param_name, param in module.named_parameters(recurse=False):
+                    if param.is_meta and "_blueprint_meta" not in name:
+                        full_name = f"{name}.{param_name}" if name else param_name
+                        print(f"Warning: Parameter {full_name} still on meta device, initializing with zeros")
+                        with torch.no_grad():
+                            new_param = nn.Parameter(torch.zeros(param.shape, device='cuda', dtype=self._dtype or torch.float16))
+                            setattr(module, param_name, new_param)
+            
             # Optional: FA2
             if is_flash_attn_2_available() and hasattr(self.model.config, "_attn_implementation"):
                 self.model.config._attn_implementation = self.cfg.attn_impl or "flash_attention_2"
