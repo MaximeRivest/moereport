@@ -15,7 +15,6 @@ import warnings
 import gc
 import os
 import re
-import types # Required for monkey-patching
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers.activations import ACT2FN
 from safetensors import safe_open
@@ -25,14 +24,44 @@ from huggingface_hub import snapshot_download
 # Requires 'accelerate' library
 try:
     from accelerate import init_empty_weights, load_checkpoint_and_dispatch
-    from transformers.cache_utils import Cache # Required for type hinting in the patch
+    # Import specific cache types for the shim
+    from transformers.cache_utils import DynamicCache, Cache
 except ImportError:
     print("Error: 'accelerate' or 'transformers' libraries not found or outdated. Please upgrade: pip install --upgrade accelerate transformers")
     init_empty_weights = None
     load_checkpoint_and_dispatch = None
+    DynamicCache = None
     Cache = None
 
 warnings.filterwarnings('ignore')
+
+# ==============================================================================
+# Compatibility Shim
+# ==============================================================================
+
+# ---- Transformers cache compatibility shim (Integrated from the working script) ----
+# Fixes compatibility issues when models (like DeepSeek V3.*) use older/internal cache APIs.
+if DynamicCache is not None and not hasattr(DynamicCache, "get_usable_length"):
+    print("Applying Transformers DynamicCache compatibility shim (get_usable_length)...")
+    def _get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
+        # Return the number of tokens already in the cache for this layer.
+        # Do NOT try to "reserve room" by subtracting new_seq_length; that can go negative on prefill.
+        if hasattr(self, "get_seq_length"):
+            try:
+                return int(self.get_seq_length(layer_idx))
+            except TypeError:
+                # Older APIs used no layer argument
+                return int(self.get_seq_length())
+        # very old fallback
+        return int(getattr(self, "seen_tokens", 0))
+
+    DynamicCache.get_usable_length = _get_usable_length
+    try:
+        if Cache is not None and not hasattr(Cache, "get_usable_length"):
+            Cache.get_usable_length = _get_usable_length
+    except Exception:
+        pass
+# ---- end shim ----
 
 # ==============================================================================
 # Data Structures
@@ -41,9 +70,9 @@ warnings.filterwarnings('ignore')
 class TokenExpertLog:
     token_id: int
     token_text: str
-    position: int
-    prompt_idx: int
+    position: int # Position in the generation sequence (0-indexed)
     layer_experts: Dict[int, List[Tuple[int, float]]]
+    layer_groups: Dict[int, List[int]] # Added group tracking
 
 @dataclass
 class PromptCompletionLog:
@@ -243,7 +272,7 @@ class ModelPatcher:
         ]
 
         # 3. Accelerate handles the loading and distribution
-        # FIX: Pass the directory path (self.repo_path), not a list of files.
+        # Pass the directory path (self.repo_path).
         self.model = load_checkpoint_and_dispatch(
             self.model,
             checkpoint=self.repo_path, # Pass the directory path
@@ -307,7 +336,7 @@ class ModelPatcher:
 
                 # Populate the container with the hybrid strategy
                 for expert_idx in range(num_experts):
-                    expert_key = f'e{expert_idx}' if is_module_dict else expert_idx
+                    # expert_key = f'e{expert_idx}' if is_module_dict else expert_idx
                     param_map = self._expert_mapping.get((layer_idx, expert_idx))
                     
                     if not param_map: continue
@@ -336,7 +365,7 @@ class ModelPatcher:
                         
                         # 3. Add to the container
                         if is_module_dict:
-                            new_experts[expert_key] = expert_mlp
+                            new_experts[f'e{expert_idx}'] = expert_mlp
                         else:
                             new_experts.append(expert_mlp)
                         pinned_count += 1
@@ -347,7 +376,7 @@ class ModelPatcher:
                         disk_expert.to(target_device) 
                         
                         if is_module_dict:
-                            new_experts[expert_key] = disk_expert
+                            new_experts[f'e{expert_idx}'] = disk_expert
                         else:
                             new_experts.append(disk_expert)
                         disk_loaded_count += 1
@@ -363,7 +392,7 @@ class ModelPatcher:
             torch.cuda.empty_cache()
 
 # ==============================================================================
-# Core MoE Expert Logger (Multi-GPU Compatible)
+# Core MoE Expert Logger (Refactored for KV Caching and Group Tracking)
 # ==============================================================================
 class MoEExpertLogger:
     
@@ -372,61 +401,83 @@ class MoEExpertLogger:
         self.model = model
         self.tokenizer = tokenizer
 
-        # Determine the primary input device (where inputs should be sent)
-        # FIX: Robustly determine the device by checking the actual location of the input embeddings.
+        # Determine the primary input device robustly
         try:
             if hasattr(model, 'get_input_embeddings') and model.get_input_embeddings() is not None:
                 self.primary_device = model.get_input_embeddings().weight.device
             else:
-                # Fallback for models without standard embedding access or if embeddings are None
                 self.primary_device = next(model.parameters()).device
         except Exception:
-            print("Warning: Could not determine primary device from model parameters. Defaulting to model.device.")
             self.primary_device = model.device
         
         # Storage and Initialization
         self.prompt_logs: List[PromptCompletionLog] = []
         self.expert_activation_counts: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
         self.expert_probability_mass: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
-        self.hook_storage = defaultdict(list)
+        # Added group tracking
+        self.group_counts: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self.group_mass: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+
+        
+        # step_buffer: Used to store the output of the hooks for the *current* forward pass.
+        self.step_buffer = {} 
         self.moe_layers = []
         self._register_hooks()
         self.config = self._extract_model_config()
+        
+        # Calculate experts per group based on config
+        n_routed = self.config.get('n_routed_experts', 0)
+        n_group = self.config.get('n_group', 1)
+        self.experts_per_group = n_routed // n_group if n_group > 0 and n_routed > 0 else n_routed
+
         print(f"✓ Logger initialized. Input device: {self.primary_device}")
 
     def _extract_model_config(self) -> Dict[str, Any]:
-        # (Implementation remains the same as previous versions)
+        # Integrated detailed configuration extraction
         cfg = self.model.config
         config = {}
-        config['num_experts'] = (
-            getattr(cfg, 'n_routed_experts', None) or getattr(cfg, 'num_experts', None)
-        )
-        config['top_k'] = getattr(cfg, 'num_experts_per_tok', 8)
-        if config['num_experts'] is None:
-             config['num_experts'] = 256 if len(self.moe_layers) > 0 else 0 
-        config['total_experts'] = len(self.moe_layers) * (config['num_experts'] or 0)
+        
+        # Core MoE parameters
+        config['n_routed_experts'] = getattr(cfg, 'n_routed_experts', None) or getattr(cfg, 'num_experts', None)
+        config['num_experts_per_tok'] = getattr(cfg, 'num_experts_per_tok', 8)
+        
+        # DeepSeek specific routing parameters (with fallbacks)
+        config['n_group'] = getattr(cfg, 'n_group', 8)
+        config['topk_group'] = getattr(cfg, 'topk_group', 4)
+        config['routed_scaling_factor'] = getattr(cfg, 'routed_scaling_factor', 2.5)
+        config['norm_topk_prob'] = getattr(cfg, 'norm_topk_prob', True)
+
+        if config['n_routed_experts'] is None:
+             # Fallback if config parsing fails
+             config['n_routed_experts'] = 256 if len(self.moe_layers) > 0 else 0 
+        
+        config['total_experts'] = len(self.moe_layers) * (config['n_routed_experts'] or 0)
         return config
 
-    def _hook_fn(self, module, input, output, layer_idx):
-        # (Implementation remains the same as previous versions)
-        cls_name = module.__class__.__name__
+    # The hook OVERWRITES the step_buffer entry for the layer
+    def _make_hook(self, layer_idx):
+        def hook(module, inputs, output):
+            # Generic hook function (DeepSeek/Qwen/Mixtral)
+            cls_name = module.__class__.__name__
 
-        if 'MoEGate' in cls_name:
-            if isinstance(output, tuple) and len(output) >= 2:
-                self.hook_storage[layer_idx].append((output[0].detach().cpu(), output[1].detach().cpu()))
-            return
+            if 'MoEGate' in cls_name:
+                if isinstance(output, tuple) and len(output) >= 2:
+                    # Move captured data to CPU immediately to save VRAM
+                    self.step_buffer[layer_idx] = (output[0].detach().cpu(), output[1].detach().cpu())
+                return
 
-        if ('Router' in cls_name and 'Mixtral' in cls_name) or ('Gate' in cls_name and 'Qwen' in cls_name):
-            router_logits = output.detach().cpu()
-            top_k = self.config.get('top_k')
-            probs = torch.softmax(router_logits.to(torch.float32), dim=-1)
-            topk_weight, topk_idx = torch.topk(probs, top_k, dim=-1)
-            if getattr(self.model.config, 'norm_topk_prob', False):
-                 topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
-            self.hook_storage[layer_idx].append((topk_idx, topk_weight))
+            if ('Router' in cls_name and 'Mixtral' in cls_name) or ('Gate' in cls_name and 'Qwen' in cls_name):
+                router_logits = output.detach().cpu()
+                top_k = self.config.get('num_experts_per_tok')
+                probs = torch.softmax(router_logits.to(torch.float32), dim=-1)
+                topk_weight, topk_idx = torch.topk(probs, top_k, dim=-1)
+                if getattr(self.model.config, 'norm_topk_prob', False):
+                     topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+                self.step_buffer[layer_idx] = (topk_idx, topk_weight)
+        return hook
 
     def _register_hooks(self):
-        # (Implementation remains the same as previous versions)
+        # (Updated to use _make_hook)
         print("Registering hooks...")
         found = 0
         base_model = self.model.model if hasattr(self.model, 'model') else self.model
@@ -434,8 +485,9 @@ class MoEExpertLogger:
             for i, layer in enumerate(base_model.layers):
                 for name, module in layer.named_modules():
                     cls_name = module.__class__.__name__
+                    # Target the actual gate/router modules
                     if 'MoEGate' in cls_name or ('Router' in cls_name and 'Mixtral' in cls_name) or ('Gate' in cls_name and 'Qwen' in cls_name):
-                        hook = partial(self._hook_fn, layer_idx=i)
+                        hook = self._make_hook(i)
                         module.register_forward_hook(hook)
                         self.moe_layers.append(i)
                         found += 1
@@ -443,13 +495,73 @@ class MoEExpertLogger:
         self.moe_layers.sort()
         print(f"✓ Registered hooks on {found} MoE layers.")
 
+    def _extract_from_step_buffer(self, position: int) -> Tuple[Dict[int, List[Tuple[int, float]]], Dict[int, List[int]]]:
+        """Extracts expert routing and groups from the step buffer for a specific position index."""
+        layer_experts = {}
+        layer_groups = {}
+        
+        for L in self.moe_layers:
+            if L not in self.step_buffer or self.step_buffer[L] is None:
+                continue
+            
+            topk_idx, topk_weight = self.step_buffer[L]
+            
+            # Handle different tensor shapes flexibly
+            # We expect [Batch*Time, K] or [Time, K] if Batch=1
+            if len(topk_idx.shape) == 2:
+                T = topk_idx.shape[0]
+                # Clamp the position index to the actual sequence length T in the buffer
+                p = min(position, T - 1)
+                idxs = topk_idx[p]
+                wts = topk_weight[p]
+            # We might also see [Batch, Time, K]
+            elif len(topk_idx.shape) == 3:
+                T = topk_idx.shape[1]
+                p = min(position, T - 1)
+                # Assume batch size 1 during analysis
+                idxs = topk_idx[0, p]
+                wts = topk_weight[0, p]
+            else:
+                continue
+            
+            expert_list = []
+            group_set = set()
+
+            for e_id, w in zip(idxs.tolist(), wts.tolist()):
+                expert_list.append((int(e_id), float(w)))
+                # Calculate group ID
+                if self.experts_per_group > 0:
+                    g_id = int(e_id) // self.experts_per_group
+                    group_set.add(g_id)
+
+            layer_experts[L] = expert_list
+            layer_groups[L] = list(group_set)
+        
+        return layer_experts, layer_groups
+
+    def _update_statistics(self, layer_experts: Dict[int, List[Tuple[int, float]]]):
+        """Updates the global statistics counters for experts and groups."""
+        for layer_idx, experts_weights in layer_experts.items():
+            for e_id, weight in experts_weights:
+                self.expert_activation_counts[layer_idx][e_id] += 1
+                self.expert_probability_mass[layer_idx][e_id] += weight
+                
+                # Update group stats
+                if self.experts_per_group > 0:
+                    g_id = e_id // self.experts_per_group
+                    self.group_counts[layer_idx][g_id] += 1
+                    self.group_mass[layer_idx][g_id] += weight
+
+
     def log_single_generation(self, prompt: str, prompt_idx: int = 0, max_new_tokens: int = 50, temperature: float = 0.0):
+        """
+        Generates completion using efficient KV caching and logs expert activations per step.
+        """
         # Prompt formatting (Robust handling)
         try:
             messages = [{"role": "user", "content": prompt}]
             if "DeepSeek" in self.model_name:
                 try:
-                    # Use non-thinking mode for analysis
                     formatted_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, thinking=False)
                 except TypeError:
                      formatted_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -458,72 +570,98 @@ class MoEExpertLogger:
         except Exception:
             formatted_text = prompt
         
-        # Move inputs to the primary device (required for multi-GPU)
-        inputs = self.tokenizer(formatted_text, return_tensors="pt").to(self.primary_device)
-        self.hook_storage.clear()
+        # Tokenize and move inputs to the primary device
+        inputs = self.tokenizer(formatted_text, return_tensors="pt", return_attention_mask=True)
+        input_ids = inputs["input_ids"].to(self.primary_device)
+        attn_mask = inputs["attention_mask"].to(self.primary_device)
 
-        # Generation
-        with torch.no_grad():
-            generation_output = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=temperature > 0,
-                temperature=temperature if temperature > 0 else None,
-                pad_token_id=self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
-            )
-        
-        # Decoding and Processing
-        output_ids = generation_output[0]
-        input_len = inputs.input_ids.shape[1]
-        generated_ids = output_ids[input_len:]
-        # Move generated IDs to CPU for processing
-        generated_ids_cpu = generated_ids.cpu()
-        generated_text = self.tokenizer.decode(generated_ids_cpu, skip_special_tokens=True)
-
-        token_logs = self._process_hook_data(generated_ids_cpu, prompt_idx)
-        return PromptCompletionLog(prompt=prompt, prompt_idx=prompt_idx, generated_text=generated_text, token_logs=token_logs, total_tokens=len(token_logs))
-
-    def _process_hook_data(self, generated_ids: torch.Tensor, prompt_idx: int) -> List[TokenExpertLog]:
-        # (Implementation remains the same as previous versions)
-        num_generated_tokens = len(generated_ids)
-        token_data = defaultdict(dict)
-
-        for layer_idx in self.moe_layers:
-            captures = self.hook_storage.get(layer_idx, [])
-            if not captures: continue
-
-            valid_captures = [c for c in captures if len(c) == 2 and c[0].numel() > 0 and c[1].numel() > 0]
-            if not valid_captures: continue
-
-            try:
-                all_indices = torch.cat([c[0] for c in valid_captures], dim=0)
-                all_weights = torch.cat([c[1] for c in valid_captures], dim=0)
-            except RuntimeError as e:
-                print(f"Warning: Error concatenating hook data at layer {layer_idx}. Skipping layer. Error: {e}")
-                continue
-
-            if all_indices.shape[0] >= num_generated_tokens:
-                gen_indices = all_indices[-num_generated_tokens:]
-                gen_weights = all_weights[-num_generated_tokens:]
-                for pos in range(num_generated_tokens):
-                    experts_weights = [(idx.item(), weight.item()) for idx, weight in zip(gen_indices[pos], gen_weights[pos])]
-                    token_data[pos][layer_idx] = experts_weights
+        B, L = input_ids.shape
+        device = self.primary_device
+        eos_id = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
 
         token_logs = []
-        for pos in range(num_generated_tokens):
-            token_id = generated_ids[pos].item()
-            token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-            layer_experts = token_data.get(pos, {})
-            token_logs.append(TokenExpertLog(token_id=token_id, token_text=token_text, position=pos, prompt_idx=prompt_idx, layer_experts=layer_experts))
+        generated_ids = []
+
+        # Prepare attention mask for generation (avoids torch.cat in loop)
+        full_attn_mask = torch.ones((B, L + max_new_tokens), dtype=attn_mask.dtype, device=device)
+        full_attn_mask[:, :L] = attn_mask
+
+        self.model.eval()
+        with torch.inference_mode():
+            # --- 1) Prefill Phase ---
+            self.step_buffer.clear() # Clear buffer before forward pass
+            out = self.model(
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                use_cache=True,
+                return_dict=True,
+            )
+            past = out.past_key_values
+
+            # Determine next token (greedy sampling for analysis)
+            next_id = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+            tok_id = next_id.item()
             
-            for layer_idx, experts_weights in layer_experts.items():
-                for expert_idx, weight in experts_weights:
-                    self.expert_activation_counts[layer_idx][expert_idx] += 1
-                    self.expert_probability_mass[layer_idx][expert_idx] += weight
-        return token_logs
+            # Extract routing for the *last* token of the prompt (which produced next_id)
+            # The buffer contains activations for all L tokens. We want index L-1.
+            layer_experts, layer_groups = self._extract_from_step_buffer(L - 1)
+            self._update_statistics(layer_experts)
+
+            # Log the first generated token
+            token_logs.append(TokenExpertLog(
+                token_id=tok_id,
+                token_text=self.tokenizer.decode([tok_id], skip_special_tokens=True),
+                position=0,
+                layer_experts=layer_experts,
+                layer_groups=layer_groups
+            ))
+            generated_ids.append(tok_id)
+
+            if tok_id == eos_id:
+                pass
+            else:
+                # --- 2) Decoding Phase ---
+                for step in range(1, max_new_tokens):
+                    cur_len = L + step
+                    
+                    self.step_buffer.clear() # Clear buffer before forward pass
+                    out = self.model(
+                        input_ids=next_id, # Feed just the last token
+                        attention_mask=full_attn_mask[:, :cur_len],
+                        past_key_values=past,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                    past = out.past_key_values
+
+                    next_id = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+                    tok_id = next_id.item()
+
+                    # Extract routing for this single token.
+                    # The buffer contains activation for 1 token. We want index 0.
+                    layer_experts, layer_groups = self._extract_from_step_buffer(0)
+                    self._update_statistics(layer_experts)
+
+                    # Log the generated token
+                    token_logs.append(TokenExpertLog(
+                        token_id=tok_id,
+                        token_text=self.tokenizer.decode([tok_id], skip_special_tokens=True),
+                        position=step,
+                        layer_experts=layer_experts,
+                        layer_groups=layer_groups
+                    ))
+                    generated_ids.append(tok_id)
+
+                    if tok_id == eos_id:
+                        break
+        
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        
+        return PromptCompletionLog(prompt=prompt, prompt_idx=prompt_idx, generated_text=generated_text, token_logs=token_logs, total_tokens=len(token_logs))
+
 
     def process_prompts(self, prompts: List[str], max_new_tokens: int = 50):
-        print(f"\nProcessing {len(prompts)} prompts...")
+        print(f"\nProcessing {len(prompts)} prompts (using optimized KV Caching loop)...")
         logs = []
         for i, prompt in enumerate(prompts):
             print(f"  Progress: {i + 1}/{len(prompts)}")
@@ -537,16 +675,18 @@ class MoEExpertLogger:
         return logs
 
 # ==============================================================================
-# MoE Analyzer (With Hot Set Identification)
+# MoE Analyzer (With Hot Set Identification and Group Analysis)
 # ==============================================================================
 class MoEAnalyzer:
-    # (Implementation remains the same as previous versions)
     def __init__(self, logger: MoEExpertLogger):
         self.logger = logger
 
     def identify_hot_expert_set(self, coverage_threshold: float = 0.95, min_experts: Optional[int] = None) -> Dict[int, Set[int]]:
+        """
+        Identifies the minimal set of experts required to cover a percentage of the total probability mass per layer.
+        """
         if min_experts is None:
-            min_experts = self.logger.config.get('top_k', 8)
+            min_experts = self.logger.config.get('num_experts_per_tok', 8)
 
         hot_expert_set = {}
         print(f"\nIdentifying Hot Expert Set (Coverage: {coverage_threshold*100:.1f}%)")
@@ -558,12 +698,14 @@ class MoEAnalyzer:
                 hot_expert_set[layer_idx] = set(range(min_experts))
                 continue
 
+            # Sort experts by probability mass contribution
             sorted_experts = sorted(layer_mass.items(), key=lambda item: item[1], reverse=True)
             total_mass = sum(mass for _, mass in sorted_experts)
             
             current_mass = 0
             hot_set = set()
             
+            # Select experts until threshold is met OR minimum count is reached
             for expert_idx, mass in sorted_experts:
                 if current_mass < total_mass * coverage_threshold or len(hot_set) < min_experts:
                     hot_set.add(expert_idx)
@@ -585,95 +727,23 @@ class MoEAnalyzer:
         with open(output_path, 'w') as f:
             json.dump(export_data, f, indent=2)
         print(f"✓ Hot Expert Set exported to {output_path}")
-
-# ==============================================================================
-# Workflow Function (Multi-GPU with Patching)
-# ==============================================================================
-
-def patch_model_for_cache_api(model):
-    """
-    Applies a monkey patch for compatibility with the latest transformers DynamicCache API.
-    Fixes: AttributeError: 'DynamicCache' object has no attribute 'seen_tokens'
-    """
-
-    # Check if the model architecture might require patching (specifically DeepSeek models using remote code)
-    if "deepseek" not in getattr(model.config, 'model_type', ''):
-        return model
     
-    if Cache is None:
-        print("Warning: Cache utils not imported. Cannot apply DynamicCache patch.")
-        return model
+    def analyze_group_utilization(self):
+        # Added analysis based on the provided script's output format
+        print(f"\n[Group Utilization Analysis]")
+        all_groups = set()
+        for layer_idx in self.logger.group_counts:
+            for g_id in self.logger.group_counts[layer_idx]:
+                all_groups.add(g_id)
+        
+        n_group = self.logger.config.get('n_group', 0)
+        print(f"  Unique groups used (across all layers): {len(all_groups)} / {n_group}")
+        print(f"  Groups IDs: {sorted(all_groups)}")
 
-    print("Applying compatibility patch for DynamicCache API (prepare_inputs_for_generation)...")
 
-    # Define the corrected method (needs 'self' as the first argument)
-    # This definition is based on the standard implementation, correcting the access to past_length.
-    def corrected_prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        **kwargs,
-    ):
-        if past_key_values is not None:
-            if isinstance(past_key_values, Cache):
-                cache_length = past_key_values.get_seq_length()
-                # --- FIX START ---
-                # The original remote code used past_key_values.seen_tokens which caused the error.
-                # We use the standard API get_seq_length() instead.
-                past_length = past_key_values.get_seq_length()
-                # --- FIX END ---
-                max_cache_length = past_key_values.get_max_length()
-            else:
-                # Legacy tuple cache
-                cache_length = past_length = past_key_values[0][0].shape[2]
-                max_cache_length = None
-
-            # Keep only the unprocessed tokens (standard logic)
-            if (
-                attention_mask is not None
-                and attention_mask.shape[1] > input_ids.shape[1]
-            ):
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            elif past_length < input_ids.shape[1]:
-                input_ids = input_ids[:, past_length:]
-
-            if (
-                max_cache_length is not None
-                and attention_mask is not None
-                and cache_length + input_ids.shape[1] > max_cache_length
-            ):
-                attention_mask = attention_mask[:, -max_cache_length:]
-
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-            }
-        )
-        return model_inputs
-
-    # Apply the patch: Replace the instance method with the corrected one
-    model.prepare_inputs_for_generation = types.MethodType(corrected_prepare_inputs_for_generation, model)
-    return model
-
+# ==============================================================================
+# Workflow Function (Multi-GPU)
+# ==============================================================================
 
 def run_analysis_and_optimization(
     model_name: str,
@@ -706,6 +776,8 @@ def run_analysis_and_optimization(
     # Load config and tokenizer (trust_remote_code=True is essential for DeepSeek)
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # =====================================================
     # Stage 1: Analysis Phase (Full Disk Offload)
@@ -717,9 +789,6 @@ def run_analysis_and_optimization(
     with init_empty_weights():
             # Ensure the model initialized from config also trusts remote code
             analysis_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True).eval()
-
-    # 1.1 Apply compatibility patch for transformers caching API
-    analysis_model = patch_model_for_cache_api(analysis_model)
 
     # 2. Initialize Patcher
     patcher = ModelPatcher(model_name, analysis_model, dtype)
@@ -740,6 +809,9 @@ def run_analysis_and_optimization(
     
     analyzer = MoEAnalyzer(logger)
     
+    # Analyze Group Utilization
+    analyzer.analyze_group_utilization()
+
     # Identify Hot Set
     hot_expert_set = analyzer.identify_hot_expert_set(coverage_threshold=optimization_coverage)
     analyzer.export_hot_set(f"{output_dir}/hot_expert_set.json", hot_set=hot_expert_set)
@@ -760,9 +832,6 @@ def run_analysis_and_optimization(
     print("Initializing optimized model structure...")
     with init_empty_weights():
             optimized_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True).eval()
-
-    # 1.1 Apply compatibility patch again
-    optimized_model = patch_model_for_cache_api(optimized_model)
 
     # 2. Re-initialize Patcher (reuse analysis from previous patcher)
     optimized_patcher = ModelPatcher(model_name, optimized_model, dtype)
@@ -787,11 +856,11 @@ if __name__ == "__main__":
     # Define your domain-specific prompts
     domain_prompts = [
         "Analyze the complexity of the QuickSort algorithm.",
-        # "Explain how MergeSort works and why it is stable.",
-        # "What is the difference between Dijkstra's algorithm and A* search?",
-        # "Describe the time and space complexity of a Hash Table.",
-        # "Implement a Python function for Depth First Search (DFS) on a graph.",
-        # "How does a Bloom Filter work and where is it commonly used?",
+        "Explain how MergeSort works and why it is stable.",
+        "What is the difference between Dijkstra's algorithm and A* search?",
+        "Describe the time and space complexity of a Hash Table.",
+        "Implement a Python function for Depth First Search (DFS) on a graph.",
+        "How does a Bloom Filter work and where is it commonly used?",
     ]
     
     # NOTE: Ensure you have multiple GPUs available.
@@ -813,7 +882,7 @@ if __name__ == "__main__":
         optimized_model, tokenizer = run_analysis_and_optimization(
             model_name=MODEL_NAME,
             prompts=domain_prompts,
-            task_name="algorithms_domain_multigpu",
+            task_name="algorithms_domain_multigpu_final",
             max_new_tokens=50, # Keep low during analysis phase as JIT loading is slow
             optimization_coverage=0.98,
             device_map="auto", # <<< Utilize all available GPUs
