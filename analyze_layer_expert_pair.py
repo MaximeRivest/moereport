@@ -88,6 +88,170 @@ def analyze_expert_usage(detailed_logs, total_experts=14848):
         'layer_usage': layer_usage
     }
 
+# Analyze overlap between experts used by different prompts
+def analyze_expert_overlap(detailed_logs, total_experts=14848):
+    # Get unique experts used by each prompt
+    prompt_experts = []
+    
+    for log_idx, detailed_log in enumerate(detailed_logs):
+        used_experts = set()
+        prompt = detailed_log['prompt']
+        
+        # Collect all unique experts for this prompt
+        for token_log in detailed_log["token_logs"]:
+            layer_experts = token_log["layer_experts"]
+            
+            for layer_num, expert_tuples in layer_experts.items():
+                for expert_tuple in expert_tuples:
+                    expert_id = expert_tuple[0]
+                    used_experts.add((layer_num, expert_id))
+        
+        prompt_experts.append({
+            'idx': log_idx,
+            'prompt': prompt,
+            'experts': used_experts,
+            'count': len(used_experts)
+        })
+    
+    print("=== EXPERT USAGE BY PROMPT ===")
+    for i, data in enumerate(prompt_experts):
+        usage_pct = (data['count'] / total_experts) * 100
+        print(f"Prompt {i}: '{data['prompt'][:50]}...'")
+        print(f"  Experts used: {data['count']:,} ({usage_pct:.2f}%)")
+    
+    # Calculate overlap between all pairs of prompts
+    print(f"\n=== EXPERT OVERLAP ANALYSIS ===")
+    
+    for i in range(len(prompt_experts)):
+        for j in range(i + 1, len(prompt_experts)):
+            experts_i = prompt_experts[i]['experts']
+            experts_j = prompt_experts[j]['experts']
+            
+            # Calculate overlap
+            overlap = experts_i & experts_j  # intersection
+            union = experts_i | experts_j    # union
+            
+            overlap_count = len(overlap)
+            union_count = len(union)
+            
+            # Calculate different overlap metrics
+            jaccard_similarity = overlap_count / union_count if union_count > 0 else 0
+            overlap_pct_i = (overlap_count / len(experts_i)) * 100 if len(experts_i) > 0 else 0
+            overlap_pct_j = (overlap_count / len(experts_j)) * 100 if len(experts_j) > 0 else 0
+            
+            print(f"\nPrompt {i} vs Prompt {j}:")
+            print(f"  '{prompt_experts[i]['prompt'][:30]}...' vs '{prompt_experts[j]['prompt'][:30]}...'")
+            print(f"  Shared experts: {overlap_count:,}")
+            print(f"  Total unique experts (union): {union_count:,}")
+            print(f"  Jaccard similarity: {jaccard_similarity:.3f}")
+            print(f"  Overlap as % of Prompt {i}: {overlap_pct_i:.1f}%")
+            print(f"  Overlap as % of Prompt {j}: {overlap_pct_j:.1f}%")
+            
+            # Unique to each prompt
+            unique_to_i = experts_i - experts_j
+            unique_to_j = experts_j - experts_i
+            print(f"  Unique to Prompt {i}: {len(unique_to_i):,}")
+            print(f"  Unique to Prompt {j}: {len(unique_to_j):,}")
+    
+    # Overall statistics if more than 2 prompts
+    if len(prompt_experts) > 2:
+        print(f"\n=== OVERALL STATISTICS ===")
+        all_experts_used = set()
+        for data in prompt_experts:
+            all_experts_used.update(data['experts'])
+        
+        total_unique_experts = len(all_experts_used)
+        total_usage_pct = (total_unique_experts / total_experts) * 100
+        
+        print(f"Total unique experts across all prompts: {total_unique_experts:,}")
+        print(f"Total model coverage: {total_usage_pct:.2f}%")
+        
+        # Find experts used by all prompts (core experts)
+        core_experts = prompt_experts[0]['experts']
+        for data in prompt_experts[1:]:
+            core_experts = core_experts & data['experts']
+        
+        print(f"Experts used by ALL prompts: {len(core_experts):,}")
+        if len(core_experts) > 0:
+            core_pct = (len(core_experts) / total_unique_experts) * 100
+            print(f"Core experts as % of total used: {core_pct:.1f}%")
+    
+    return {
+        'prompt_experts': prompt_experts,
+        'total_experts': total_experts
+    }
+
+# Optional: Analyze layer-wise overlap
+def analyze_layer_wise_overlap(detailed_logs):
+    print(f"\n=== LAYER-WISE OVERLAP ANALYSIS ===")
+    
+    # Get experts used per layer for each prompt
+    prompt_layer_experts = []
+    
+    for log_idx, detailed_log in enumerate(detailed_logs):
+        layer_experts_dict = {}
+        
+        for token_log in detailed_log["token_logs"]:
+            layer_experts = token_log["layer_experts"]
+            
+            for layer_num, expert_tuples in layer_experts.items():
+                if layer_num not in layer_experts_dict:
+                    layer_experts_dict[layer_num] = set()
+                
+                for expert_tuple in expert_tuples:
+                    expert_id = expert_tuple[0]
+                    layer_experts_dict[layer_num].add(expert_id)
+        
+        prompt_layer_experts.append({
+            'idx': log_idx,
+            'prompt': detailed_log['prompt'],
+            'layer_experts': layer_experts_dict
+        })
+    
+    # Compare layer by layer
+    if len(prompt_layer_experts) >= 2:
+        prompt_0 = prompt_layer_experts[0]
+        prompt_1 = prompt_layer_experts[1]
+        
+        all_layers = set(prompt_0['layer_experts'].keys()) | set(prompt_1['layer_experts'].keys())
+        
+        layer_overlaps = []
+        for layer_num in sorted(all_layers):
+            experts_0 = prompt_0['layer_experts'].get(layer_num, set())
+            experts_1 = prompt_1['layer_experts'].get(layer_num, set())
+            
+            overlap = len(experts_0 & experts_1)
+            total_0 = len(experts_0)
+            total_1 = len(experts_1)
+            union_size = len(experts_0 | experts_1)
+            
+            jaccard = overlap / union_size if union_size > 0 else 0
+            layer_overlaps.append((layer_num, overlap, jaccard, total_0, total_1))
+        
+        print(f"Layer-by-layer overlap:")
+        print(f"Layer | Shared | Jaccard | Prompt0 | Prompt1")
+        print(f"------|--------|---------|---------|--------")
+        for layer_num, overlap, jaccard, total_0, total_1 in layer_overlaps[:10]:  # Show first 10
+            print(f"{layer_num:5d} | {overlap:6d} | {jaccard:7.3f} | {total_0:7d} | {total_1:7d}")
+        
+        if len(layer_overlaps) > 10:
+            print("...")
+            for layer_num, overlap, jaccard, total_0, total_1 in layer_overlaps[-5:]:  # Show last 5
+                print(f"{layer_num:5d} | {overlap:6d} | {jaccard:7.3f} | {total_0:7d} | {total_1:7d}")
+        
+        # Summary stats
+        avg_jaccard = sum(x[2] for x in layer_overlaps) / len(layer_overlaps)
+        print(f"\nAverage Jaccard similarity across layers: {avg_jaccard:.3f}")
+
+# Run layer-wise analysis
+# Assuming you have detailed_logs[0], [1], [2], [3]
+overlap_results = analyze_expert_overlap([
+    detailed_logs[0],  # French poutine
+    detailed_logs[1],  # Pandas 1
+    detailed_logs[2],  # English poutine  
+    detailed_logs[3]   # Pandas 2
+], total_experts=9920)
+
 # Run the analysis
 results = analyze_expert_usage([detailed_logs[1]], total_experts=14848)
 
@@ -97,4 +261,13 @@ results = analyze_expert_usage([detailed_logs[1]], total_experts=14848)
 # for i, (layer, expert_id) in enumerate(sorted_experts[:20]):
 #     print(f"  Layer {layer}, Expert {expert_id}")
 
-results = analyze_expert_usage(detailed_logs, total_experts=14848)
+results = analyze_expert_usage(detailed_logs, total_experts=9920)
+
+
+for i in detailed_logs:
+    print("-" * 40)
+    print(f"Prompt: {i['prompt']}")
+    print(f"Generated: {i['generated_text']}")
+
+
+

@@ -1,0 +1,41 @@
+----------------------------------------
+Prompt: Convert this list [[1,2,3], [4,5,6]] into a pandas DataFrame with columns 'A', 'B', 'C'
+Generated: Here's how to convert the list into a pandas DataFrame with the specified column names:
+
+```python
+import pandas as pd
+
+# Your list
+data = [[1,2,3], [4,5,6]]
+
+# Convert to DataFrame with specified column names
+df = pd.DataFrame(data,
+----------------------------------------
+Prompt: Convert this list [[8,9,10], [6,5,4]] into a pandas DataFrame with columns 'A', 'B', 'C'
+Generated: Here's how to convert that list into a pandas DataFrame with the specified column names:
+
+```python
+import pandas as pd
+
+# Your list
+data = [[8,9,10], [6,5,4]]
+
+# Convert to DataFrame with specified column names
+df = pd.DataFrame(data
+----------------------------------------
+Prompt: Convert this list [[1,2,3], [4,5,6]] into a julia DataFrame with columns 'A', 'B', 'C'
+Generated: Here's how to convert the list `[[1,2,3], [4,5,6]]` into a Julia DataFrame with columns 'A', 'B', 'C':
+
+```julia
+using DataFrames
+
+# Your data
+data = [[1,2,3], [
+----------------------------------------
+Prompt: Convert this list [[1,2,3], [4,5,6]] into a R DataFrame with columns 'A', 'B', 'C'
+Generated: Here's how to convert the list `[[1,2,3], [4,5,6]]` into an R DataFrame with columns 'A', 'B', 'C':
+
+```r
+# Method 1: Using data.frame() with manual assignment
+df <- data.frame(
+ 
